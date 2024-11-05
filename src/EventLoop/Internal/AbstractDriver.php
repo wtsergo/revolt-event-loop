@@ -23,6 +23,14 @@ use Revolt\EventLoop\UncaughtThrowable;
  */
 abstract class AbstractDriver implements Driver
 {
+    /** @var array<int, \mysqli> */
+    protected array $mysqliLinks = [];
+
+    /** @var array<int, array<string, MysqliCallback>> */
+    protected array $mysqliCallbacks = [];
+
+    private bool $mysqliPoolIgnoreResult = false;
+
     /** @var string Next callback identifier. */
     private string $nextId = "a";
 
@@ -594,6 +602,10 @@ abstract class AbstractDriver implements Driver
                                 $callback->id,
                                 $callback->signal
                             ),
+                            $callback instanceof MysqliCallback => ($callback->closure)(
+                                $callback->id,
+                                $callback->mysqli
+                            ),
                             default => ($callback->closure)($callback->id),
                         };
 
@@ -633,5 +645,73 @@ abstract class AbstractDriver implements Driver
                     : throw UncaughtThrowable::throwingErrorHandler($errorHandler, $exception);
             }
         };
+    }
+
+    public function onMysqli(\mysqli $mysqli, \Closure $closure): string
+    {
+        $mysqliCallback = new MysqliCallback($this->nextId++, $closure, $mysqli, spl_object_id($mysqli));
+
+        $this->callbacks[$mysqliCallback->id] = $mysqliCallback;
+        $this->enableQueue[$mysqliCallback->id] = $mysqliCallback;
+
+        return $mysqliCallback->id;
+    }
+
+    /**
+     * @param array<int, \mysqli> $links
+     */
+    protected function mysqliPoolLinks(array $links, float $timeout): bool
+    {
+        if (!empty($links)) { // Use stream_select() if there are any streams in the loop.
+            if ($timeout >= 0) {
+                $seconds = (int) $timeout;
+                $microseconds = (int) (($timeout - $seconds) * 1_000_000);
+            } else {
+                $seconds = 0;
+                $microseconds = 0;
+            }
+
+            $read = $error = $reject = [];
+            foreach ($links as $link) {
+                $read[] = $error[] = $reject[] = $link;
+            }
+
+            // TODO: check is own error handler needed
+            //\set_error_handler($this->streamSelectErrorHandler);
+
+            try {
+                /** @psalm-suppress InvalidArgument */
+                $result = \mysqli::poll($read, $error, $reject, $seconds, $microseconds);
+            } finally {
+                // TODO: check is own error handler needed
+                //\restore_error_handler();
+            }
+
+            if ($this->mysqliPoolIgnoreResult || $result === 0 || $result === false) {
+                $this->mysqliPoolIgnoreResult = false;
+                return false;
+            }
+
+            if (!$result) {
+                throw new \Exception('Unknown error during mysqli::poll');
+            }
+
+            foreach ([$read, $error, $reject] as $__links) {
+                foreach ($__links as $link) {
+                    $streamId = spl_object_id($link);
+                    if (!isset($this->mysqliCallbacks[$streamId])) {
+                        continue; // All read callbacks disabled.
+                    }
+
+                    foreach ($this->mysqliCallbacks[$streamId] as $callback) {
+                        $this->enqueueCallback($callback);
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        return true;
     }
 }

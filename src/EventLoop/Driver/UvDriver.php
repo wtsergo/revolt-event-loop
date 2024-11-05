@@ -6,6 +6,7 @@ namespace Revolt\EventLoop\Driver;
 
 use Revolt\EventLoop\Internal\AbstractDriver;
 use Revolt\EventLoop\Internal\DriverCallback;
+use Revolt\EventLoop\Internal\MysqliCallback;
 use Revolt\EventLoop\Internal\SignalCallback;
 use Revolt\EventLoop\Internal\StreamCallback;
 use Revolt\EventLoop\Internal\StreamReadableCallback;
@@ -131,6 +132,12 @@ final class UvDriver extends AbstractDriver
      */
     protected function dispatch(bool $blocking): void
     {
+        // TODO find timeout value when $blocking=true
+        $this->mysqliPoolLinks(
+            $this->mysqliLinks,
+            0.0
+        );
+        $blocking = $blocking && count($this->mysqliLinks)==0;
         /** @psalm-suppress TooManyArguments */
         \uv_run($this->handle, $blocking ? \UV::RUN_ONCE : \UV::RUN_NOWAIT);
     }
@@ -144,6 +151,15 @@ final class UvDriver extends AbstractDriver
 
         foreach ($callbacks as $callback) {
             $id = $callback->id;
+
+            if ($callback instanceof MysqliCallback) {
+                \assert($callback->mysqli instanceof \mysqli);
+
+                $streamId = $callback->streamId;
+                $this->mysqliCallbacks[$streamId][$callback->id] = $callback;
+                $this->mysqliLinks[$streamId] = $callback->mysqli;
+                continue;
+            }
 
             if ($callback instanceof StreamCallback) {
                 \assert(\is_resource($callback->stream));
